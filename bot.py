@@ -25,6 +25,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import tempfile
 import time
@@ -359,6 +360,7 @@ async def run_cli_agent(client, chat: int, prompt: str, status_id: int, key: str
                            or f"⏳ {d['label']} working…")
         await proc.wait()
         text = "".join(out).strip() or "(no output)"
+        LAST_OUTPUT[chat] = text
         if proc.returncode:
             text = f"⚠ exit {proc.returncode}\n\n{text}"
         await edit(client, chat, status_id, text[:TG_LIMIT])
@@ -371,6 +373,102 @@ async def run_cli_agent(client, chat: int, prompt: str, status_id: int, key: str
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".cache", ".venv", "venv",
              ".npm", ".local", "dist", "build"}
 MAX_UPLOAD = 45 * 1024 * 1024  # Telegram bot upload limit is 50MB
+
+# ---- self-healing: install whatever the agent says is missing -----------------
+AUTO_INSTALL = os.environ.get("AUTO_INSTALL", "1").lower() not in ("0", "false", "no")
+
+MISSING_MODULE_RE = re.compile(r"No module named '([A-Za-z0-9_.\-]+)'")
+MISSING_LIB_RE = re.compile(
+    r"([A-Za-z0-9_.+\-]+\.so(?:\.[0-9]+)*): cannot open shared object file")
+MISSING_BIN_RE = re.compile(r"([A-Za-z0-9_.+\-]+): (?:command not found|not found)")
+
+BIN_TO_APT = {
+    "ffmpeg": "ffmpeg", "ffprobe": "ffmpeg", "convert": "imagemagick", "magick": "imagemagick",
+    "tesseract": "tesseract-ocr", "pandoc": "pandoc", "soffice": "libreoffice",
+    "pdftoppm": "poppler-utils", "gs": "ghostscript", "jq": "jq", "zip": "zip",
+    "unzip": "unzip", "rg": "ripgrep", "tree": "tree", "git": "git", "nano": "nano",
+}
+
+
+SO_OVERRIDES = {
+    "libglib-2.0.so.0": "libglib2.0-0", "libgobject-2.0.so.0": "libglib2.0-0",
+    "libgthread-2.0.so.0": "libglib2.0-0", "libgio-2.0.so.0": "libglib2.0-0",
+    "libatk-1.0.so.0": "libatk1.0-0", "libatk-bridge-2.0.so.0": "libatk-bridge2.0-0",
+    "libpango-1.0.so.0": "libpango-1.0-0", "libxkbcommon.so.0": "libxkbcommon0",
+    "libstdc++.so.6": "libstdc++6", "libgcc_s.so.1": "libgcc-s1",
+    "libz.so.1": "zlib1g", "libbz2.so.1.0": "libbz2-1.0",
+    "libssl.so.3": "libssl3", "libcrypto.so.3": "libssl3",
+    "libffi.so.8": "libffi8", "liblzma.so.5": "liblzma5",
+    "libexpat.so.1": "libexpat1", "libsqlite3.so.0": "libsqlite3-0",
+    "libuuid.so.1": "libuuid1", "libasound.so.2": "libasound2",
+    "libnss3.so": "libnss3", "libnspr4.so": "libnspr4",
+    "libdrm.so.2": "libdrm2", "libgbm.so.1": "libgbm1",
+    "libcairo.so.2": "libcairo2", "libcups.so.2": "libcups2",
+    "libsm.so.6": "libsm6", "libice.so.6": "libice6",
+    "libxext.so.6": "libxext6", "libxrender.so.1": "libxrender1",
+    "libxi.so.6": "libxi6", "libxfixes.so.3": "libxfixes3",
+    "libxrandr.so.2": "libxrandr2", "libxcb.so.1": "libxcb1",
+}
+
+
+def so_to_apt(soname: str) -> str:
+    """libEGL.so.1 -> libegl1 ; libgomp.so.1 -> libgomp1 ; libGL.so.1 -> libgl1"""
+    if soname in SO_OVERRIDES:
+        return SO_OVERRIDES[soname]
+    base = soname.split(".so")[0].lower()
+    tail = soname.split(".so", 1)[1].lstrip(".")
+    suffix = re.sub(r"[^0-9]", "", tail)[:2]
+    return base + (suffix or "")
+
+
+async def _run(cmd: str, timeout: int = 600) -> tuple[int, str]:
+    try:
+        p = await asyncio.create_subprocess_shell(
+            cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            cwd=AGENT_CWD, env={**os.environ})
+        out, _ = await asyncio.wait_for(p.communicate(), timeout=timeout)
+        return p.returncode or 0, out.decode("utf-8", "replace")
+    except Exception as e:
+        return 1, f"{type(e).__name__}: {e}"
+
+
+async def auto_heal(text: str) -> list[str]:
+    """Install anything the agent reported as missing. Returns human-readable notes."""
+    if not AUTO_INSTALL:
+        return []
+    notes: list[str] = []
+
+    mods = {m.split(".")[0] for m in MISSING_MODULE_RE.findall(text)}
+    for mod in sorted(mods):
+        if mod in ("__main__",) or not mod:
+            continue
+        rc, out = await _run(f"pip install --user --break-system-packages {shlex.quote(mod)}")
+        if rc != 0:
+            rc2, out2 = await _run(f"pip install --user {shlex.quote(mod)}")
+            rc = rc2
+            out = out2
+        notes.append(f"pip `{mod}` → {'✅' if rc == 0 else '❌ ' + out.strip().splitlines()[-1][:80] if out.strip() else '❌'}")
+
+    for so in sorted(set(MISSING_LIB_RE.findall(text))):
+        pkg = so_to_apt(so)
+        rc, out = await _run(
+            "sudo -n sh -c 'apt-get update -qq && apt-get install -y --no-install-recommends "
+            f"{shlex.quote(pkg)}'", timeout=900)
+        if rc != 0:
+            rc, out = await _run(f"sudo -n apt-get install -y --no-install-recommends {shlex.quote(pkg)}",
+                                 timeout=900)
+        notes.append(f"apt `{pkg}` ({so}) → {'✅' if rc == 0 else '❌'}")
+
+    for b in sorted(set(MISSING_BIN_RE.findall(text))):
+        pkg = BIN_TO_APT.get(b)
+        if not pkg:
+            continue
+        rc, _out = await _run(
+            f"sudo -n sh -c 'apt-get update -qq && apt-get install -y --no-install-recommends {pkg}'",
+            timeout=900)
+        notes.append(f"apt `{pkg}` ({b}) → {'✅' if rc == 0 else '❌'}")
+
+    return notes
 
 
 async def send_document(client, chat: int, path: str, caption: str = "") -> bool:
@@ -419,10 +517,14 @@ async def attach_new_files(client, chat: int, since: float) -> None:
         await send_document(client, chat, p, f"{rel} · {os.path.getsize(p)//1024} KB")
 
 
+LAST_OUTPUT: dict[int, str] = {}
+
+
 async def run_agent(client, chat: int, prompt: str, status_id: int) -> None:
     st = STATE.setdefault(chat, {"session": None, "model": DEFAULT_MODEL, "busy": False})
     key = st.get("agent", "claude")
     t0 = time.time() - 1
+
     if key != "claude":
         st["busy"] = True
         try:
@@ -431,6 +533,28 @@ async def run_agent(client, chat: int, prompt: str, status_id: int) -> None:
             st["busy"] = False
     else:
         await run_claude_agent(client, chat, prompt, status_id)
+
+    # ---- self-heal: install whatever was reported missing, then retry once ----
+    out = LAST_OUTPUT.get(chat, "")
+    if AUTO_INSTALL and out:
+        notes = await auto_heal(out)
+        if notes:
+            await send(client, chat, "🛠 *Auto-installed missing deps*\n" + "\n".join(f"• {n}" for n in notes))
+            if any("✅" in n for n in notes):
+                await edit(client, chat, status_id,
+                           "🔁 Dependencies installed — retrying…")
+                if key != "claude":
+                    st["busy"] = True
+                    try:
+                        await run_cli_agent(client, chat, prompt, status_id, key)
+                    finally:
+                        st["busy"] = False
+                else:
+                    await run_claude_agent(
+                        client, chat,
+                        prompt + "\n\n(System note: the missing dependencies were just installed. Retry now.)",
+                        status_id)
+
     try:
         await attach_new_files(client, chat, t0)
     except Exception as e:
@@ -481,6 +605,7 @@ async def run_claude_agent(client, chat: int, prompt: str, status_id: int) -> No
         final = "\n".join(text_acc).strip() or "(no text output)"
         if tools:
             final = f"🔧 {', '.join(dict.fromkeys(tools))}\n\n{final}"
+        LAST_OUTPUT[chat] = final
         await edit(client, chat, status_id, final[:TG_LIMIT])
         if len(final) > TG_LIMIT:
             await send(client, chat, final[TG_LIMIT:])
@@ -730,6 +855,19 @@ async def handle_message(client, chat: int, text: str, reply_to: int) -> None:
             await send(client, chat, "⚠ Could not send (too large? >45 MB)", reply_to)
         return
 
+    if low.startswith("/install "):
+        pkg = text.split(maxsplit=1)[1].strip()
+        await send(client, chat, f"📦 installing `{pkg}`…", reply_to)
+        rc, out = await _run(f"pip install --user --break-system-packages {shlex.quote(pkg)}")
+        if rc != 0:
+            rc, out = await _run(
+                f"sudo -n sh -c 'apt-get update -qq && apt-get install -y --no-install-recommends {shlex.quote(pkg)}'",
+                timeout=900)
+        tail_out = "\n".join(out.strip().splitlines()[-6:])[:1200]
+        await send(client, chat, ("✅ installed" if rc == 0 else "❌ failed") + f"\n```\n{tail_out}\n```",
+                   reply_to, MAIN_KB)
+        return
+
     if low in ("/skills", "/skill"):
         skills = list_skills()
         body = "\n".join(f"• `{s}`" for s in skills) or "(none yet)"
@@ -809,9 +947,60 @@ async def handle_callback(client, chat: int, data: str, msg_id: int, cq_id: str)
 # --------------------------------------------------------------------------- #
 # main loop
 # --------------------------------------------------------------------------- #
+AUTO_INSTALL_SKILL = """---
+name: auto-install
+description: Use whenever a Python module, shared library or system binary is missing. Install it yourself instead of asking the user.
+---
+
+# Auto-install missing dependencies
+
+You run inside a container where you can install things yourself. **Never** answer
+"please install X" or "I cannot render" — install it, verify, then continue.
+
+## Python module missing
+`ModuleNotFoundError: No module named 'foo'`
+```bash
+pip install --user --break-system-packages foo
+```
+
+## Shared library missing
+`ImportError: libEGL.so.1: cannot open shared object file`
+```bash
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends libegl1
+```
+Map `libX.so.N` → `libxN` (`libGL.so.1`→`libgl1`, `libgomp.so.1`→`libgomp1`,
+`libEGL.so.1`→`libegl1`). Common set for OpenCV/moviepy/mediapipe:
+`libegl1 libgl1 libglx-mesa0 libglib2.0-0 libgomp1 libsm6 libxext6 libxrender1`
+
+## System binary missing
+`ffmpeg: command not found` → `sudo apt-get install -y ffmpeg`
+
+## Rules
+- Verify with a one-line import or `--version`, then carry on with the task.
+- Prefer headless variants (`opencv-python-headless`).
+- There is **no GPU** — don't install CUDA/torch-CUDA stacks.
+- Keep installs minimal; don't upgrade unrelated packages.
+"""
+
+
+def ensure_auto_install_skill() -> None:
+    try:
+        d = os.path.join(SKILLS_DIR, "auto-install")
+        p = os.path.join(d, "SKILL.md")
+        if not os.path.isfile(p):
+            os.makedirs(d, exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(AUTO_INSTALL_SKILL)
+            print(f"[skills] wrote {p}", flush=True)
+    except Exception as e:
+        print("[skills] could not write auto-install skill:", e, flush=True)
+
+
 async def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("TELEGRAM_BOT_TOKEN is required")
+    ensure_auto_install_skill()
     print(f"[bot] starting · cwd={AGENT_CWD} model={DEFAULT_MODEL} mode={PERMISSION_MODE}", flush=True)
 
     offset = 0
