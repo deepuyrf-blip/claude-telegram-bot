@@ -87,7 +87,7 @@ Send any message — the agent runs it in `{cwd}` with full tools.
 
 Tap the buttons below, or use the commands.
 
-/new · /model · /models · /status · /stop · /skills · /help
+/new · /model · /models · /agent · /status · /stop · /skills · /help
 
 Send a `.md` (SKILL.md) or `.zip` to install a skill.
 """.strip()
@@ -129,7 +129,8 @@ def kb(rows: list[list[tuple[str, str]]]) -> dict:
 
 MAIN_KB = kb([
     [("🆕 New session", "act:new"), ("🤖 Models", "act:models")],
-    [("📊 Status", "act:status"), ("⏹ Stop", "act:stop")],
+    [("🧠 Agent", "act:agent"), ("📊 Status", "act:status")],
+    [("⏹ Stop", "act:stop")],
 ])
 
 
@@ -291,7 +292,95 @@ def group_page(gi: int, page: int) -> tuple[str, dict]:
 # --------------------------------------------------------------------------- #
 # agent
 # --------------------------------------------------------------------------- #
+# ---- agents ----------------------------------------------------------------
+AGENT_DEFS: dict[str, dict[str, Any]] = {
+    "claude": {"label": "🟠 Claude Code", "bin": None},
+    "codex": {"label": "🟢 Codex CLI", "bin": "codex",
+              "args": ["exec", "{prompt}"]},
+    "cursor": {"label": "🖱 Cursor Agent", "bin": "cursor-agent",
+               "args": ["-p", "{prompt}"]},
+    "opencode": {"label": "⌨ OpenCode", "bin": "opencode",
+                 "args": ["run", "{prompt}"]},
+}
+
+
+def agent_available(key: str) -> bool:
+    d = AGENT_DEFS.get(key)
+    if not d:
+        return False
+    if d["bin"] is None:
+        return True
+    return shutil.which(d["bin"]) is not None
+
+
+def agent_menu() -> tuple[str, dict]:
+    rows, pair = [], []
+    for key, d in AGENT_DEFS.items():
+        ok = agent_available(key)
+        pair.append((f"{d['label']}{'' if ok else ' (not installed)'}", f"ag:{key}" if ok else "noop"))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([("✖ Close", "noop_close")])
+    cur = STATE.get(next(iter(STATE), 0), {}).get("agent", "claude")
+    text = (f"*Agents*\nCurrent: `{cur}`\n\n"
+            "Claude uses the Agent SDK (tools, sessions). The others run their CLI "
+            "non-interactively in the same workspace.")
+    return text, kb(rows)
+
+
+async def run_cli_agent(client, chat: int, prompt: str, status_id: int, key: str) -> None:
+    d = AGENT_DEFS[key]
+    bin_path = shutil.which(d["bin"])
+    if not bin_path:
+        await edit(client, chat, status_id, f"⚠ `{d['bin']}` is not installed in this container.")
+        return
+
+    cmd = [bin_path] + [a.replace("{prompt}", prompt) for a in d["args"]]
+    out: list[str] = []
+    last = 0.0
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=AGENT_CWD,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env={**os.environ},
+        )
+        assert proc.stdout is not None
+        async for raw in proc.stdout:
+            out.append(raw.decode("utf-8", "replace"))
+            now = time.time()
+            if now - last > 2.0:
+                last = now
+                await edit(client, chat, status_id, "".join(out)[-TG_LIMIT:]
+                           or f"⏳ {d['label']} working…")
+        await proc.wait()
+        text = "".join(out).strip() or "(no output)"
+        if proc.returncode:
+            text = f"⚠ exit {proc.returncode}\n\n{text}"
+        await edit(client, chat, status_id, text[:TG_LIMIT])
+        if len(text) > TG_LIMIT:
+            await send(client, chat, text[TG_LIMIT:])
+    except Exception as e:
+        await edit(client, chat, status_id, f"⚠ {type(e).__name__}: {e}"[:TG_LIMIT])
+
+
 async def run_agent(client, chat: int, prompt: str, status_id: int) -> None:
+    st = STATE.setdefault(chat, {"session": None, "model": DEFAULT_MODEL, "busy": False})
+    key = st.get("agent", "claude")
+    if key != "claude":
+        st["busy"] = True
+        try:
+            await run_cli_agent(client, chat, prompt, status_id, key)
+        finally:
+            st["busy"] = False
+        return
+    await run_claude_agent(client, chat, prompt, status_id)
+
+
+async def run_claude_agent(client, chat: int, prompt: str, status_id: int) -> None:
     st = STATE.setdefault(chat, {"session": None, "model": DEFAULT_MODEL, "busy": False})
     st["busy"] = True
 
@@ -354,7 +443,8 @@ async def do_action(client, chat: int, action: str, msg_id: int | None, reply_to
         st["session"] = None
         text, markup = "🆕 New session started.", MAIN_KB
     elif action == "status":
-        text, markup = (f"*model:* `{st.get('model')}`\n"
+        text, markup = (f"*agent:* `{st.get('agent', 'claude')}`\n"
+                        f"*model:* `{st.get('model')}`\n"
                         f"*session:* `{st.get('session') or 'new'}`\n"
                         f"*cwd:* `{AGENT_CWD}`\n"
                         f"*permissions:* `{PERMISSION_MODE}`"), MAIN_KB
@@ -364,6 +454,8 @@ async def do_action(client, chat: int, action: str, msg_id: int | None, reply_to
     elif action == "models":
         await fetch_models(force=True)
         text, markup = model_menu()
+    elif action == "agent":
+        text, markup = agent_menu()
     else:
         return
 
@@ -556,6 +648,9 @@ async def handle_message(client, chat: int, text: str, reply_to: int) -> None:
         await send(client, chat, HELP.format(cwd=AGENT_CWD), reply_to, MAIN_KB)
         return
 
+    if low in ("/agent", "/agents"):
+        return await do_action(client, chat, "agent", None, reply_to)
+
     if low in ("/skills", "/skill"):
         skills = list_skills()
         body = "\n".join(f"• `{s}`" for s in skills) or "(none yet)"
@@ -611,6 +706,15 @@ async def handle_callback(client, chat: int, data: str, msg_id: int, cq_id: str)
         st = STATE.setdefault(chat, {"session": None, "model": DEFAULT_MODEL, "busy": False})
         st["model"] = mid
         await edit(client, chat, msg_id, f"✅ Model set to `{mid}`", MAIN_KB)
+        return
+
+    if data.startswith("ag:"):
+        key = data.split(":", 1)[1]
+        if key not in AGENT_DEFS or not agent_available(key):
+            return
+        st = STATE.setdefault(chat, {"session": None, "model": DEFAULT_MODEL, "busy": False})
+        st["agent"] = key
+        await edit(client, chat, msg_id, f"✅ Agent set to *{AGENT_DEFS[key]['label']}*", MAIN_KB)
         return
 
     if data == "noop":
