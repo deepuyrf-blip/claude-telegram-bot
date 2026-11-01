@@ -1,0 +1,18 @@
+services:
+  telegram-bot:
+    build: .
+    container_name: claude-telegram-bot
+    restart: unless-stopped
+    environment:
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN}"
+      TELEGRAM_ALLOWED_CHATS: "${TELEGRAM_ALLOWED_CHATS:-}"
+      AGENT_CWD: "/workspace"
+      AGENT_MODEL: "${AGENT_MODEL:-sonnet}"
+      AGENT_PERMISSION_MODE: "${AGENT_PERMISSION_MODE:-bypassPermissions}"
+      # provider for Claude Code (or point at your own gateway):
+      ANTHROPIC_BASE_URL: "${ANTHROPIC_BASE_URL:-}"
+      ANTHROPIC_AUTH_TOKEN: "${ANTHROPIC_AUTH_TOKEN:-}"
+      ANTHROPIC_API_KEY: ""
+    volumes:
+      - "${WORKSPACE_DIR:-./workspace}:/workspace"
+      - "${CLAUDE_CONFIG:-./claude}:/root/.claude"
