@@ -188,34 +188,94 @@ async def fetch_models(force: bool = False) -> list[str]:
     return MODELS["list"]
 
 
-def model_keyboard(page: int) -> tuple[str, dict]:
-    models = MODELS["list"]
-    pages = max(1, (len(models) + PAGE - 1) // PAGE)
+# vendor groups — models are bucketed by id prefix, so any provider works
+GROUP_RULES: list[tuple[str, tuple[str, ...]]] = [
+    ("🟠 Anthropic Claude", ("claude",)),
+    ("🟢 OpenAI", ("gpt", "o1", "o3", "o4", "chatgpt", "codex", "davinci")),
+    ("🔵 Google Gemini", ("gemini", "gemma", "imagen", "veo")),
+    ("🦙 Meta Llama", ("llama",)),
+    ("🐉 Qwen", ("qwen",)),
+    ("🐋 DeepSeek", ("deepseek",)),
+    ("🌙 Kimi / Moonshot", ("kimi", "moonshot")),
+    ("✨ GLM / Z.ai", ("glm", "zai", "zhipu")),
+    ("✖ xAI Grok", ("grok",)),
+    ("🌬 Mistral", ("mistral", "magistral", "codestral", "devstral")),
+    ("🖱 Cursor", ("cursor",)),
+    ("⌨ OpenCode / Zen", ("opencode", "zen")),
+    ("🤗 Hugging Face", ("hf", "huggingface")),
+]
+OTHER_GROUP = "📦 Other"
+
+
+def build_groups(models: list[str]) -> list[tuple[str, list[str]]]:
+    buckets: dict[str, list[str]] = {}
+    for mid in models:
+        low = mid.lower()
+        label = OTHER_GROUP
+        for glabel, prefixes in GROUP_RULES:
+            if low.startswith(prefixes) or any(p in low for p in prefixes if len(p) > 3):
+                label = glabel
+                break
+        buckets.setdefault(label, []).append(mid)
+    order = [g for g, _ in GROUP_RULES] + [OTHER_GROUP]
+    return [(g, buckets[g]) for g in order if g in buckets]
+
+
+def current_model() -> str:
+    if not STATE:
+        return DEFAULT_MODEL
+    return next(iter(STATE.values())).get("model", DEFAULT_MODEL)
+
+
+def model_menu() -> tuple[str, dict]:
+    groups = build_groups(MODELS["list"])
+    MODELS["groups"] = groups
+    rows, pair = [], []
+    for i, (glabel, items) in enumerate(groups):
+        pair.append((f"{glabel} ({len(items)})", f"g:{i}:0"))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([("🔄 Reload", "act:models"), ("✖ Close", "noop_close")])
+    text = (f"*Models* — {len(MODELS['list'])} available, {len(groups)} groups\n"
+            f"Current: `{current_model()}`\n\nPick a provider:")
+    return text, kb(rows)
+
+
+def group_page(gi: int, page: int) -> tuple[str, dict]:
+    groups = MODELS.get("groups") or build_groups(MODELS["list"])
+    MODELS["groups"] = groups
+    if not (0 <= gi < len(groups)):
+        return model_menu()
+    glabel, items = groups[gi]
+    pages = max(1, (len(items) + PAGE - 1) // PAGE)
     page = max(0, min(page, pages - 1))
-    MODELS["page"][page] = models[page * PAGE:(page + 1) * PAGE]
+    chunk = items[page * PAGE:(page + 1) * PAGE]
 
     rows: list[list[tuple[str, str]]] = []
-    for i in range(0, len(MODELS["page"][page]), 2):
-        pair = []
-        for j in (i, i + 1):
-            if j < len(MODELS["page"][page]):
-                mid = MODELS["page"][page][j]
-                label = mid if len(mid) <= 28 else mid[:26] + "…"
-                pair.append((label, f"m:{page}:{j - i}"))
+    pair: list[tuple[str, str]] = []
+    for j, mid in enumerate(chunk):
+        label = mid if len(mid) <= 30 else mid[:28] + "…"
+        pair.append((label, f"m:{gi}:{page}:{j}"))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
         rows.append(pair)
 
-    nav = []
+    nav: list[tuple[str, str]] = [("« Back", "mm")]
     if page > 0:
-        nav.append(("« Prev", f"mp:{page-1}"))
+        nav.append(("‹", f"g:{gi}:{page-1}"))
     nav.append((f"{page+1}/{pages}", "noop"))
     if page < pages - 1:
-        nav.append(("Next »", f"mp:{page+1}"))
+        nav.append(("›", f"g:{gi}:{page+1}"))
     rows.append(nav)
-    rows.append([("🔄 Reload list", "act:models"), ("✖ Close", "noop_close")])
+    rows.append([("✖ Close", "noop_close")])
 
-    text = (f"*Models* ({len(models)} available)\n"
-            f"Current: `{STATE.get(next(iter(STATE), 0), {}).get('model', DEFAULT_MODEL)}`\n\n"
-            "Tap one to use it.")
+    text = (f"*{glabel}* — {len(items)} models\n"
+            f"Current: `{current_model()}`\n\nTap one to use it.")
     return text, kb(rows)
 
 
@@ -294,7 +354,7 @@ async def do_action(client, chat: int, action: str, msg_id: int | None, reply_to
         text, markup = "⏹ Noted — the current turn will finish; next message starts fresh.", MAIN_KB
     elif action == "models":
         await fetch_models(force=True)
-        text, markup = model_keyboard(0)
+        text, markup = model_menu()
     else:
         return
 
@@ -340,17 +400,30 @@ async def handle_media(client, chat: int, file_id: str, suffix: str, caption: st
         await edit(client, chat, status, "⚠ Could not download that file. Try again?")
         return
 
+    head = (caption.strip() + "\n\n") if caption.strip() else ""
     if kind == "image":
-        prompt = ((caption.strip() + "\n\n") if caption.strip() else "") + (
+        prompt = head + (
             f"I sent you an image. It is saved at: {path}\n"
             "Use the Read tool to open it, then tell me what you see / do what I asked."
         )
-    else:  # voice / audio
-        prompt = ((caption.strip() + "\n\n") if caption.strip() else "") + (
+    elif kind == "video":
+        prompt = head + (
+            f"I sent you a video. It is saved at: {path}\n"
+            "Inspect it yourself with ffprobe/ffmpeg (extract keyframes to a temp dir, read them "
+            "with the Read tool, pull the audio track and transcribe it with faster-whisper), "
+            "then tell me what happens / do what I asked. Clean up temp files when done."
+        )
+    elif kind == "audio":
+        prompt = head + (
             f"I sent you an audio file at: {path}\n"
-            "Transcribe it (faster-whisper is installed: `python3 -c \"from faster_whisper import "
-            "WhisperModel as W; m=W('small'); print(''.join(s.text for s in m.transcribe('" + path +
-            "')[0]))\"`), then do what I asked."
+            "Transcribe it with faster-whisper (it is installed), then do what I asked:\n"
+            f"  python3 -c \"from faster_whisper import WhisperModel as W; "
+            f"m=W('small'); print(''.join(s.text for s in m.transcribe('{path}')[0]))\""
+        )
+    else:  # any other file
+        prompt = head + (
+            f"I sent you a file: {path}\n"
+            "Look at it (file/ffprobe/unzip/tesseract/Read as appropriate), then do what I asked."
         )
 
     await edit(client, chat, status, "⏳ working…")
@@ -391,21 +464,26 @@ async def handle_message(client, chat: int, text: str, reply_to: int) -> None:
 async def handle_callback(client, chat: int, data: str, msg_id: int, cq_id: str) -> None:
     await tg(client, "answerCallbackQuery", callback_query_id=cq_id)
 
+    if data == "mm":
+        text, markup = model_menu()
+        await edit(client, chat, msg_id, text, markup)
+        return
+
+    if data.startswith("g:"):
+        _, gi, page = data.split(":")
+        text, markup = group_page(int(gi), int(page))
+        await edit(client, chat, msg_id, text, markup)
+        return
+
     if data.startswith("m:"):
-        _, page, idx = data.split(":")
+        _, gi, page, idx = data.split(":")
         try:
-            mid = MODELS["page"][int(page)][int(idx)]
+            mid = MODELS["groups"][int(gi)][1][int(page) * PAGE + int(idx)]
         except Exception:
             return
         st = STATE.setdefault(chat, {"session": None, "model": DEFAULT_MODEL, "busy": False})
         st["model"] = mid
         await edit(client, chat, msg_id, f"✅ Model set to `{mid}`", MAIN_KB)
-        return
-
-    if data.startswith("mp:"):
-        page = int(data.split(":")[1])
-        text, markup = model_keyboard(page)
-        await edit(client, chat, msg_id, text, markup)
         return
 
     if data == "noop":
@@ -487,10 +565,32 @@ async def main() -> None:
                     asyncio.create_task(handle_media(client, chat, photos[-1]["file_id"],
                                                      ".jpg", caption, msg.get("message_id"), "image"))
                     continue
-                if doc and str(doc.get("mime_type", "")).startswith("image/"):
-                    suffix = os.path.splitext(doc.get("file_name") or "img.jpg")[1] or ".jpg"
+                video = msg.get("video") or msg.get("video_note") or {}
+                sticker = msg.get("sticker") or {}
+
+                if video:
+                    suffix = ".mp4"
+                    asyncio.create_task(handle_media(client, chat, video["file_id"],
+                                                     suffix, caption, msg.get("message_id"), "video"))
+                    continue
+                if sticker:
+                    asyncio.create_task(handle_media(client, chat, sticker["file_id"],
+                                                     ".webp", caption, msg.get("message_id"), "image"))
+                    continue
+                if doc:
+                    mime = str(doc.get("mime_type", ""))
+                    name = doc.get("file_name") or "file.bin"
+                    suffix = os.path.splitext(name)[1] or ".bin"
+                    if mime.startswith("image/"):
+                        kind = "image"
+                    elif mime.startswith("video/"):
+                        kind = "video"
+                    elif mime.startswith("audio/"):
+                        kind = "audio"
+                    else:
+                        kind = "file"
                     asyncio.create_task(handle_media(client, chat, doc["file_id"],
-                                                     suffix, caption, msg.get("message_id"), "image"))
+                                                     suffix, caption, msg.get("message_id"), kind))
                     continue
                 if voice:
                     suffix = ".ogg" if msg.get("voice") else ".mp3"
