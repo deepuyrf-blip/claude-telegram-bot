@@ -23,8 +23,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import secrets
+import shutil
+import tempfile
 import time
+import zipfile
 from typing import Any
 
 import httpx
@@ -72,6 +76,7 @@ if not BASE_URL or not MODELS_KEY:
 TG_LIMIT = 3900
 PAGE = 8  # model buttons per page
 UPLOAD_DIR = os.path.join(AGENT_CWD, "uploads")
+SKILLS_DIR = os.path.expanduser("~/.claude/skills")
 
 STATE: dict[int, dict[str, Any]] = {}
 MODELS: dict[str, Any] = {"list": [], "ts": 0.0, "page": {}}
@@ -81,6 +86,10 @@ HELP = """*Claude Code bot*
 Send any message — the agent runs it in `{cwd}` with full tools.
 
 Tap the buttons below, or use the commands.
+
+/new · /model · /models · /status · /stop · /skills · /help
+
+Send a `.md` (SKILL.md) or `.zip` to install a skill.
 """.strip()
 
 
@@ -387,6 +396,115 @@ async def download_tg_file(client, file_id: str, suffix: str) -> str | None:
         return None
 
 
+# --------------------------------------------------------------------------- #
+# skills (.md / .zip upload)
+# --------------------------------------------------------------------------- #
+def _slug(s: str) -> str:
+    s = re.sub(r"[^a-zA-Z0-9._-]+", "-", (s or "").strip()).strip("-.").lower()
+    return s or "skill"
+
+
+def _frontmatter_name(text: str) -> str | None:
+    m = re.match(r"^---\s*\n(.*?)\n---", text, re.S)
+    if not m:
+        return None
+    for line in m.group(1).splitlines():
+        if line.lower().startswith("name:"):
+            return line.split(":", 1)[1].strip().strip('"\'')
+    return None
+
+
+def looks_like_skill_md(text: str) -> bool:
+    head = text[:1200]
+    return head.lstrip().startswith("---") and "name:" in head and "description:" in head
+
+
+def _safe_extract(zf: zipfile.ZipFile, dest: str) -> None:
+    base = os.path.realpath(dest)
+    for member in zf.namelist():
+        target = os.path.realpath(os.path.join(dest, member))
+        if target != base and not target.startswith(base + os.sep):
+            raise ValueError(f"unsafe path in zip: {member}")
+    zf.extractall(dest)
+
+
+def list_skills() -> list[str]:
+    if not os.path.isdir(SKILLS_DIR):
+        return []
+    return sorted(d for d in os.listdir(SKILLS_DIR)
+                  if os.path.isfile(os.path.join(SKILLS_DIR, d, "SKILL.md")))
+
+
+def install_skill(path: str) -> tuple[bool, str]:
+    """Install a SKILL.md file or a zip containing one. Returns (ok, name|error)."""
+    name = _slug(os.path.splitext(os.path.basename(path))[0])
+    os.makedirs(SKILLS_DIR, exist_ok=True)
+    try:
+        if path.lower().endswith(".zip"):
+            tmp = tempfile.mkdtemp()
+            try:
+                with zipfile.ZipFile(path) as zf:
+                    _safe_extract(zf, tmp)
+                found = None
+                for root, _dirs, files in os.walk(tmp):
+                    if "SKILL.md" in files:
+                        found = root
+                        break
+                if found:
+                    md = open(os.path.join(found, "SKILL.md"), encoding="utf-8", errors="ignore").read()
+                    name = _slug(_frontmatter_name(md) or os.path.basename(found) or name)
+                    dest = os.path.join(SKILLS_DIR, name)
+                    shutil.rmtree(dest, ignore_errors=True)
+                    shutil.copytree(found, dest)
+                else:
+                    dest = os.path.join(SKILLS_DIR, name)
+                    shutil.rmtree(dest, ignore_errors=True)
+                    shutil.copytree(tmp, dest)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+            return True, name
+
+        md = open(path, encoding="utf-8", errors="ignore").read()
+        name = _slug(_frontmatter_name(md) or name)
+        dest = os.path.join(SKILLS_DIR, name)
+        os.makedirs(dest, exist_ok=True)
+        shutil.copyfile(path, os.path.join(dest, "SKILL.md"))
+        return True, name
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+async def handle_skill_upload(client, chat: int, file_id: str, filename: str,
+                              caption: str, reply_to: int) -> None:
+    status = await send(client, chat, "📥 downloading…", reply_to)
+    suffix = os.path.splitext(filename)[1] or ".md"
+    path = await download_tg_file(client, file_id, suffix)
+    if not path:
+        await edit(client, chat, status, "⚠ Could not download that file.")
+        return
+
+    # a .md that isn't a SKILL.md → let the agent handle it as a normal file
+    if path.lower().endswith(".md"):
+        text = open(path, encoding="utf-8", errors="ignore").read()
+        if not looks_like_skill_md(text):
+            await edit(client, chat, status, "⏳ working…")
+            prompt = ((caption.strip() + "\n\n") if caption.strip() else "") + (
+                f"I sent you a markdown file: {path}\nRead it and do what I asked.")
+            await run_agent(client, chat, prompt, status)
+            return
+
+    ok, info = install_skill(path)
+    if ok:
+        skills = list_skills()
+        await edit(client, chat, status,
+                   f"✅ Skill installed: `{info}`\n\n"
+                   f"*Installed skills:* {', '.join('`'+s+'`' for s in skills) or '(none)'}\n\n"
+                   "Naya Claude Code session isse load kar lega — "
+                   f"`/{info}` se bhi chala sakte ho.", MAIN_KB)
+    else:
+        await edit(client, chat, status, f"⚠ Skill install failed:\n`{info}`", MAIN_KB)
+
+
 async def handle_media(client, chat: int, file_id: str, suffix: str, caption: str,
                        reply_to: int, kind: str = "image") -> None:
     st = STATE.setdefault(chat, {"session": None, "model": DEFAULT_MODEL, "busy": False})
@@ -436,6 +554,15 @@ async def handle_message(client, chat: int, text: str, reply_to: int) -> None:
 
     if low in ("/start", "/help", "/h"):
         await send(client, chat, HELP.format(cwd=AGENT_CWD), reply_to, MAIN_KB)
+        return
+
+    if low in ("/skills", "/skill"):
+        skills = list_skills()
+        body = "\n".join(f"• `{s}`" for s in skills) or "(none yet)"
+        await send(client, chat,
+                   f"*Skills* (`{SKILLS_DIR}`)\n{body}\n\n"
+                   "Send a `.md` (SKILL.md) or a `.zip` containing one to install it.",
+                   reply_to, MAIN_KB)
         return
 
     if low == "/status":
@@ -578,6 +705,12 @@ async def main() -> None:
                                                      ".webp", caption, msg.get("message_id"), "image"))
                     continue
                 if doc:
+                    fname = (doc.get("file_name") or "").lower()
+                    if fname.endswith((".zip", ".md")):
+                        asyncio.create_task(handle_skill_upload(
+                            client, chat, doc["file_id"], doc.get("file_name") or "skill.md",
+                            caption, msg.get("message_id")))
+                        continue
                     mime = str(doc.get("mime_type", ""))
                     name = doc.get("file_name") or "file.bin"
                     suffix = os.path.splitext(name)[1] or ".bin"
