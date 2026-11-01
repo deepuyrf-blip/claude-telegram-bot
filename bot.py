@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
 import time
 from typing import Any
 
@@ -70,6 +71,7 @@ if not BASE_URL or not MODELS_KEY:
 
 TG_LIMIT = 3900
 PAGE = 8  # model buttons per page
+UPLOAD_DIR = os.path.join(AGENT_CWD, "uploads")
 
 STATE: dict[int, dict[str, Any]] = {}
 MODELS: dict[str, Any] = {"list": [], "ts": 0.0, "page": {}}
@@ -302,6 +304,59 @@ async def do_action(client, chat: int, action: str, msg_id: int | None, reply_to
         await send(client, chat, text, reply_to, markup)
 
 
+async def download_tg_file(client, file_id: str, suffix: str) -> str | None:
+    """Fetch a Telegram file into AGENT_CWD/uploads and return its path."""
+    r = await tg(client, "getFile", file_id=file_id)
+    if not r.get("ok"):
+        print("[dl] getFile failed:", r, flush=True)
+        return None
+    file_path = r["result"]["file_path"]
+    url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+    try:
+        async with httpx.AsyncClient(timeout=180) as cx:
+            resp = await cx.get(url)
+        resp.raise_for_status()
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+        dest = os.path.join(UPLOAD_DIR, f"{int(time.time())}_{secrets.token_hex(3)}{suffix}")
+        with open(dest, "wb") as f:
+            f.write(resp.content)
+        print(f"[dl] saved {dest} ({len(resp.content)} bytes)", flush=True)
+        return dest
+    except Exception as e:
+        print("[dl] failed:", e, flush=True)
+        return None
+
+
+async def handle_media(client, chat: int, file_id: str, suffix: str, caption: str,
+                       reply_to: int, kind: str = "image") -> None:
+    st = STATE.setdefault(chat, {"session": None, "model": DEFAULT_MODEL, "busy": False})
+    if st.get("busy"):
+        await send(client, chat, "⏳ Still working on the previous message…", reply_to)
+        return
+
+    status = await send(client, chat, "📥 downloading…", reply_to)
+    path = await download_tg_file(client, file_id, suffix)
+    if not path:
+        await edit(client, chat, status, "⚠ Could not download that file. Try again?")
+        return
+
+    if kind == "image":
+        prompt = ((caption.strip() + "\n\n") if caption.strip() else "") + (
+            f"I sent you an image. It is saved at: {path}\n"
+            "Use the Read tool to open it, then tell me what you see / do what I asked."
+        )
+    else:  # voice / audio
+        prompt = ((caption.strip() + "\n\n") if caption.strip() else "") + (
+            f"I sent you an audio file at: {path}\n"
+            "Transcribe it (faster-whisper is installed: `python3 -c \"from faster_whisper import "
+            "WhisperModel as W; m=W('small'); print(''.join(s.text for s in m.transcribe('" + path +
+            "')[0]))\"`), then do what I asked."
+        )
+
+    await edit(client, chat, status, "⏳ working…")
+    await run_agent(client, chat, prompt, status)
+
+
 async def handle_message(client, chat: int, text: str, reply_to: int) -> None:
     st = STATE.setdefault(chat, {"session": None, "model": DEFAULT_MODEL, "busy": False})
     low = text.strip().lower()
@@ -413,8 +468,7 @@ async def main() -> None:
 
                 msg = upd.get("message") or {}
                 chat = (msg.get("chat") or {}).get("id")
-                text = msg.get("text") or ""
-                if not chat or not text:
+                if not chat:
                     continue
 
                 if not ALLOWED:
@@ -422,6 +476,30 @@ async def main() -> None:
                     print(f"[bot] locked to first chat: {chat}", flush=True)
                 if chat not in ALLOWED:
                     await send(client, chat, "⛔ Not authorised. Add this chat id to TELEGRAM_ALLOWED_CHATS.")
+                    continue
+
+                caption = msg.get("caption") or ""
+                photos = msg.get("photo") or []
+                doc = msg.get("document") or {}
+                voice = msg.get("voice") or msg.get("audio") or {}
+
+                if photos:  # pick the largest size
+                    asyncio.create_task(handle_media(client, chat, photos[-1]["file_id"],
+                                                     ".jpg", caption, msg.get("message_id"), "image"))
+                    continue
+                if doc and str(doc.get("mime_type", "")).startswith("image/"):
+                    suffix = os.path.splitext(doc.get("file_name") or "img.jpg")[1] or ".jpg"
+                    asyncio.create_task(handle_media(client, chat, doc["file_id"],
+                                                     suffix, caption, msg.get("message_id"), "image"))
+                    continue
+                if voice:
+                    suffix = ".ogg" if msg.get("voice") else ".mp3"
+                    asyncio.create_task(handle_media(client, chat, voice["file_id"],
+                                                     suffix, caption, msg.get("message_id"), "audio"))
+                    continue
+
+                text = msg.get("text") or ""
+                if not text:
                     continue
 
                 asyncio.create_task(handle_message(client, chat, text, msg.get("message_id")))
