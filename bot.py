@@ -87,7 +87,8 @@ Send any message — the agent runs it in `{cwd}` with full tools.
 
 Tap the buttons below, or use the commands.
 
-/new · /model · /models · /agent · /status · /stop · /skills · /help
+/new · /model · /models · /agent · /status · /stop
+/ls · /get <path> · /skills · /help
 
 Send a `.md` (SKILL.md) or `.zip` to install a skill.
 """.strip()
@@ -367,17 +368,73 @@ async def run_cli_agent(client, chat: int, prompt: str, status_id: int, key: str
         await edit(client, chat, status_id, f"⚠ {type(e).__name__}: {e}"[:TG_LIMIT])
 
 
+SKIP_DIRS = {".git", "node_modules", "__pycache__", ".cache", ".venv", "venv",
+             ".npm", ".local", "dist", "build"}
+MAX_UPLOAD = 45 * 1024 * 1024  # Telegram bot upload limit is 50MB
+
+
+async def send_document(client, chat: int, path: str, caption: str = "") -> bool:
+    name = os.path.basename(path)
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) > MAX_UPLOAD:
+            return False
+        with open(path, "rb") as fh:
+            files = {"document": (name, fh, "application/octet-stream")}
+            data = {"chat_id": str(chat)}
+            if caption:
+                data["caption"] = caption[:1000]
+            r = await client.post(f"{API}/sendDocument", data=data, files=files, timeout=300)
+        ok = r.json().get("ok", False)
+        print(f"[file] {name}: {'sent' if ok else r.text[:120]}", flush=True)
+        return ok
+    except Exception as e:
+        print("[file] failed:", name, e, flush=True)
+        return False
+
+
+def collect_new_files(since: float, limit: int = 6) -> list[str]:
+    """Files under AGENT_CWD modified after `since` (newest first)."""
+    found: list[tuple[float, str]] = []
+    for root, dirs, files in os.walk(AGENT_CWD):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+        for f in files:
+            p = os.path.join(root, f)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            if st.st_mtime >= since and st.st_size <= MAX_UPLOAD and st.st_size > 0:
+                found.append((st.st_mtime, p))
+    found.sort(reverse=True)
+    return [p for _t, p in found[:limit]]
+
+
+async def attach_new_files(client, chat: int, since: float) -> None:
+    paths = collect_new_files(since)
+    if not paths:
+        return
+    await send(client, chat, f"📎 {len(paths)} file(s) created/updated:")
+    for p in paths:
+        rel = os.path.relpath(p, AGENT_CWD)
+        await send_document(client, chat, p, f"{rel} · {os.path.getsize(p)//1024} KB")
+
+
 async def run_agent(client, chat: int, prompt: str, status_id: int) -> None:
     st = STATE.setdefault(chat, {"session": None, "model": DEFAULT_MODEL, "busy": False})
     key = st.get("agent", "claude")
+    t0 = time.time() - 1
     if key != "claude":
         st["busy"] = True
         try:
             await run_cli_agent(client, chat, prompt, status_id, key)
         finally:
             st["busy"] = False
-        return
-    await run_claude_agent(client, chat, prompt, status_id)
+    else:
+        await run_claude_agent(client, chat, prompt, status_id)
+    try:
+        await attach_new_files(client, chat, t0)
+    except Exception as e:
+        print("[attach]", e, flush=True)
 
 
 async def run_claude_agent(client, chat: int, prompt: str, status_id: int) -> None:
@@ -650,6 +707,28 @@ async def handle_message(client, chat: int, text: str, reply_to: int) -> None:
 
     if low in ("/agent", "/agents"):
         return await do_action(client, chat, "agent", None, reply_to)
+
+    if low in ("/ls", "/files"):
+        items = collect_new_files(0, limit=40)
+        if not items:
+            await send(client, chat, f"(no files in `{AGENT_CWD}`)", reply_to)
+            return
+        listing = "\n".join(f"• `{os.path.relpath(p, AGENT_CWD)}`" for p in items)
+        await send(client, chat, f"*Files* in `{AGENT_CWD}`\n{listing}\n\n"
+                                 "Send `/get <path>` to download one.", reply_to, MAIN_KB)
+        return
+
+    if low.startswith("/get "):
+        rel = text.split(maxsplit=1)[1].strip().strip("`")
+        path = rel if os.path.isabs(rel) else os.path.join(AGENT_CWD, rel)
+        path = os.path.realpath(path)
+        if not path.startswith(os.path.realpath(AGENT_CWD)) or not os.path.isfile(path):
+            await send(client, chat, f"⚠ Not found (or outside the workspace): `{rel}`", reply_to)
+            return
+        ok = await send_document(client, chat, path, rel)
+        if not ok:
+            await send(client, chat, "⚠ Could not send (too large? >45 MB)", reply_to)
+        return
 
     if low in ("/skills", "/skill"):
         skills = list_skills()
