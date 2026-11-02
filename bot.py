@@ -570,6 +570,8 @@ async def run_claude_agent(client, chat: int, prompt: str, status_id: int) -> No
         model=st.get("model") or DEFAULT_MODEL,
         permission_mode=PERMISSION_MODE,
         max_turns=MAX_TURNS,
+        # images arrive as base64 in tool results — the default 1 MB buffer is far too small
+        max_buffer_size=64 * 1024 * 1024,
         allowed_tools=["Bash", "Read", "Write", "Edit", "Glob", "Grep",
                        "WebFetch", "WebSearch", "TodoWrite"],
     )
