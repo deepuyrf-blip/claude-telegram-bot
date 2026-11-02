@@ -797,8 +797,14 @@ async def handle_media(client, chat: int, file_id: str, suffix: str, caption: st
     head = (caption.strip() + "\n\n") if caption.strip() else ""
     if kind == "image":
         prompt = head + (
-            f"I sent you an image. It is saved at: {path}\n"
-            "Use the Read tool to open it, then tell me what you see / do what I asked."
+            f"I sent you an image. It is saved at: {path}\n\n"
+            "Open it with the Read tool, then answer ONLY from what you can actually see.\n"
+            "Rules:\n"
+            "1. Read any visible text verbatim (it may be a screenshot, email, chat, document).\n"
+            "2. Describe what the image really contains. Do NOT guess or invent.\n"
+            "3. If you cannot actually see image content with this model, reply exactly:\n"
+            "   \"I cannot see images with this model — switch to a vision model.\"\n"
+            "   Do not make anything up."
         )
     elif kind == "video":
         prompt = head + (
