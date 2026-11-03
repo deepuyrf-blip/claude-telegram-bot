@@ -855,7 +855,11 @@ async def handle_message(client, chat: int, text: str, reply_to: int) -> None:
         rel = text.split(maxsplit=1)[1].strip().strip("`")
         path = rel if os.path.isabs(rel) else os.path.join(AGENT_CWD, rel)
         path = os.path.realpath(path)
-        if not path.startswith(os.path.realpath(AGENT_CWD)) or not os.path.isfile(path):
+        # NOTE: compare with the base *plus a separator*. A bare startswith() would
+        # let "/home/agent/workspace2/x" pass as being inside "/home/agent/workspace"
+        # (path-traversal / sibling-directory leak — reported in issue #1).
+        base = os.path.realpath(AGENT_CWD)
+        if not (path == base or path.startswith(base + os.sep)) or not os.path.isfile(path):
             await send(client, chat, f"⚠ Not found (or outside the workspace): `{rel}`", reply_to)
             return
         ok = await send_document(client, chat, path, rel)
